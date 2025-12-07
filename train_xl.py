@@ -303,8 +303,12 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         print(f"step {iter_num}: evaluating loss")
         losses = estimate_loss()
+        bpc_train = losses['train'] / math.log(2)
+        bpc_val = losses['val'] / math.log(2)
         print(
-            f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+            f"step {iter_num}: "
+            f"train loss {losses['train']:.4f}, train bpc {bpc_train:.4f}, "
+            f"val loss {losses['val']:.4f}, bpc {bpc_val:.4f}"
         )
         if wandb_log:
             wandb.log(
@@ -383,11 +387,12 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
+        bpc = lossf / math.log(2)
         if local_iter_num >= 5:  # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
         print(
-            f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, mfu {running_mfu * 100:.2f}%"
+            f"iter {iter_num}: loss {lossf:.4f}, bpc {bpc:.4f}, time {dt * 1000:.2f}ms, mfu {running_mfu * 100:.2f}%"
         )
     iter_num += 1
     local_iter_num += 1
