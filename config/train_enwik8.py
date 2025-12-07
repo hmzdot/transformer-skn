@@ -1,4 +1,5 @@
 import torch
+import platform
 
 dataset = "enwik8"
 out_dir = "out-enwik8"
@@ -27,4 +28,7 @@ weight_decay = 1e-1
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-compile = True if device == "cuda" else False
+
+print(platform.system())
+is_linux = platform.system() == "Linux"
+compile = device == "cuda" and is_linux
