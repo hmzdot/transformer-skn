@@ -15,12 +15,12 @@ gradient_accumulation_steps = 8
 
 # total number of tokens is 100M
 # 100M tokens / 98,304 tokens/iter = 1017.28 iters
-max_iters = 1017
-lr_decay_iters = 1017
+max_iters = 100_000
+lr_decay_iters = 100_000
 
 # eval stuff
 eval_interval = 1000
-eval_iters = 1  # originally 200
+eval_iters = 200
 log_interval = 10
 
 # weight decay
