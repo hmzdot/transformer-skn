@@ -4,7 +4,7 @@ import platform
 dataset = "enwik8"
 out_dir = "out-enwik8"
 
-wandb_log = False
+wandb_log = True
 wandb_project = "enwik8"
 wandb_run_name = "enwik8-baseline"
 
