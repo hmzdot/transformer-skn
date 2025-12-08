@@ -6,8 +6,9 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+
 class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+    """LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False"""
 
     def __init__(self, ndim, bias):
         super().__init__()
@@ -17,8 +18,8 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class CausalSelfAttention(nn.Module):
 
+class RelSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -28,6 +29,18 @@ class CausalSelfAttention(nn.Module):
         self.queries = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.keys = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.values = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+        self.head_dim = config.n_embd // config.n_head
+
+        self.u = nn.Parameter(torch.zeros(config.n_head, self.head_dim))
+        self.v = nn.Parameter(torch.zeros(config.n_head, self.head_dim))
+        self.r_proj = nn.Linear(self.head_dim, config.n_embd, bias=False)
+
+        # sinusoidal table for relative positions (0 .. block_size+mem_len-1)
+        max_len = config.block_size + config.mem_len
+        pos_table = self.sinusoidal_table(max_len, self.head_dim)  # [max_len, d_h]
+        self.register_buffer("pos_emb_table", pos_table, persistent=False)
+
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -35,82 +48,122 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+
+    @staticmethod
+    def sinusoidal_table(
+        max_len: int,
+        d_h: int,
+    ) -> torch.Tensor:
+        """Out: table (max_len, d_h)"""
+        pos = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)  # (max_len, 1)
+        i = torch.arange(d_h // 2, dtype=torch.float32).unsqueeze(0)  # (1, d_h/2)
+        denom = torch.pow(10000, 2 * i / d_h)  # (1, d_h/2)
+
+        angles = pos / denom  # (max_len, d_h/2)
+        table = torch.zeros(max_len, d_h)
+        table[:, 0::2] = torch.sin(angles)
+        table[:, 1::2] = torch.cos(angles)
+        return table  # (max_len, d_h)
 
     def forward(self, x, mem=None):
         """
         In: x: (B, T, n_embd), mem: (B, M, n_embd)
         Out: y: (B, T, n_embd), new_mem: (B, M + T, n_embd)
         """
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size()
 
         if mem is not None:
             M = mem.size(1)
-            x_ext = torch.cat([mem, x], dim=1) # (B,T + M,n_embd)
+            x_ext = torch.cat([mem, x], dim=1)  # (B,T + M,n_embd)
         else:
             M = 0
-            x_ext = x # (B,T,n_embd)
-        L = M + T # Layer length
- 
-        q = self.queries(x) # (B,T,n_embd)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            x_ext = x  # (B,T,n_embd)
+        L = M + T  # Layer length
+
+        pos_seq = torch.arange(L - 1, -1, -1, device=x.device)  # (L), reversed
+        R = self.r_proj(self.pos_emb_table[pos_seq])  # (L, C)
+        R = R.view(1, L, self.n_head, C // self.n_head).transpose(
+            1, 2
+        )  # (1, nh, L, hs)
+
+        u = self.u.unsqueeze(0).unsqueeze(2)  # (1, nh, 1, hs)
+        v = self.v.unsqueeze(0).unsqueeze(2)  # (1, nh, 1, hs)
+
+        q = self.queries(x)  # (B,T,n_embd)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
+
+        q_u = q + u  # (B, nh, T, hs)
+        q_v = q + v  # (B, nh, T, hs)
 
         k = self.keys(x_ext)
-        k = k.view(B, L, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, L, hs)
+        k = k.view(B, L, self.n_head, C // self.n_head).transpose(
+            1, 2
+        )  # (B, nh, L, hs)
 
         v = self.values(x_ext)
-        v = v.view(B, L, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, L, hs)
+        v = v.view(B, L, self.n_head, C // self.n_head).transpose(
+            1, 2
+        )  # (B, nh, L, hs)
 
         # Build causal mask over extended keys
-        #region Review later
-        key_idx = torch.arange(L, device=x.device) # (L)
-        query_idx = torch.arange(T, device=x.device) + M # (T)
-        causal = key_idx.unsqueeze(0) <= query_idx.unsqueeze(1) # (T,L)
-        attn_mask = torch.zeros(T, L, device=x.device)
-        attn_mask = attn_mask.masked_fill(~causal, float('-inf')) # (T,L)
-        attn_mask = attn_mask.view(1, 1, T, L)
-        #endregion
+        # region Review later
+        key_idx = torch.arange(L, device=x.device)  # (L)
+        query_idx = torch.arange(T, device=x.device) + M  # (T)
+        causal = key_idx.unsqueeze(0) <= query_idx.unsqueeze(1)  # (T,L)
+        attn_mask = ~causal  # True where disallowed
+        attn_mask = attn_mask.view(1, 1, T, L)  # (1,1,T,L)
+        # endregion
 
-        # Self-attend: (B,H,T,hs) x (B,H,hs,L) -> (B,H,T,L)
-        if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout if self.training else 0,
-                is_causal=False, # Can't use causal because not a square matrix
-            )
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B,H,T,L)
-            att = att + attn_mask # (B,H,T,L)
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B,H,T,L) x (B,H,L,hs) -> (B,H,T,hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) 
+        AC = torch.matmul(q_u, k.transpose(-2, -1))  # (B,H,T,L)
+        BD_tilde = torch.matmul(q_v, R.transpose(-2, -1))  # [B,H,T,L_rel]
+        BD = self.rel_shift(BD_tilde)  # [B,H,T,L] aligned with K
+        scores = (AC + BD) / math.sqrt(self.head_dim)
+        scores = scores.masked_fill(attn_mask, float("-inf"))
+        att = F.softmax(scores, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v  # (B,H,T,L) x (B,H,L,hs) -> (B,H,T,hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-#region Review later
+        # region Review later
         # Output projection
         y = self.resid_dropout(self.c_proj(y))
 
         if self.mem_len > 0:
             if mem is None:
-                new_mem_full = x.detach() # (B, T, C)
+                new_mem_full = x.detach()  # (B, T, C)
             else:
-                new_mem_full = torch.cat([mem, x.detach()], dim=1) # (B, M+T, C)
-            new_mem = new_mem_full[:, -self.mem_len:, :] # (B, mem_len, C)
+                new_mem_full = torch.cat([mem, x.detach()], dim=1)  # (B, M+T, C)
+            new_mem = new_mem_full[:, -self.mem_len :, :]  # (B, mem_len, C)
         else:
             new_mem = None
+        # endregion
 
         return y, new_mem
-#endregion
+
+    def rel_shift(self, x):
+        """
+        Maps relative position embeddings to absolute position embeddings.
+        In: x: (B, H, T, L)
+        Out: x: (B, H, T, L)
+        """
+        zero_pad = torch.zeros(
+            (x.size(0), x.size(1), x.size(2), 1), device=x.device, dtype=x.dtype
+        )
+        x_padded = torch.cat([zero_pad, x], dim=3)
+        x_padded = x_padded.view(x.size(0), x.size(1), x.size(3) + 1, x.size(2))
+        x = x_padded[:, :, 1:, :].view_as(x)  # (B, H, T, L)
+        return x
+
 
 class MLP(nn.Module):
-
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -120,12 +173,12 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
-class Block(nn.Module):
 
+class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = RelSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -135,16 +188,18 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x, new_mem
 
+
 @dataclass
 class TransformerXLConfig:
     block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     mem_len: int = 2048
+
 
 class TransformerXL(nn.Module):
     """Implements [Transformer-XL](https://arxiv.org/abs/1901.02860)"""
@@ -155,22 +210,26 @@ class TransformerXL(nn.Module):
         assert config.block_size is not None
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        self.transformer = nn.ModuleDict(
+            dict(
+                wte=nn.Embedding(config.vocab_size, config.n_embd),
+                drop=nn.Dropout(config.dropout),
+                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                ln_f=LayerNorm(config.n_embd, bias=config.bias),
+            )
+        )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
 
         # Initialize weights, per GPT-2
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+            if pn.endswith("c_proj.weight"):
+                torch.nn.init.normal_(
+                    p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
+                )
 
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
     def get_num_params(self):
         """
@@ -192,15 +251,17 @@ class TransformerXL(nn.Module):
 
     def forward(self, idx, mem=None, targets=None):
         """
-        In: idx: (B,T), mem: list[(M, n_embd)], targets: (B,T) 
+        In: idx: (B,T), mem: list[(M, n_embd)], targets: (B,T)
         Out: logits: (B,T,C), loss: np.float32
         """
-        device = idx.device # TODO: Check if we create any tensors in new code
+        device = idx.device  # TODO: Check if we create any tensors in new code
         _, T = idx.size()
-        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        assert T <= self.config.block_size, (
+            f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        )
 
         # Forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # (B,T,n_embd)
+        tok_emb = self.transformer.wte(idx)  # (B,T,n_embd)
         x = self.transformer.drop(tok_emb)
 
         if mem is None:
@@ -215,10 +276,14 @@ class TransformerXL(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1
+            )
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(
+                x[:, [-1], :]
+            )  # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, new_mem, loss
@@ -230,8 +295,8 @@ class TransformerXL(nn.Module):
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
         for block in self.transformer.h:
-            if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+            if hasattr(block.attn, "bias"):
+                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
@@ -243,35 +308,41 @@ class TransformerXL(nn.Module):
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        print(
+            f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
+        )
+        print(
+            f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters"
+        )
         # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == "cuda"
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        optimizer = torch.optim.AdamW(
+            optim_groups, lr=learning_rate, betas=betas, **extra_args
+        )
         print(f"using fused AdamW: {use_fused}")
 
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        """estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS"""
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
         cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
+        flops_per_token = 6 * N + 12 * L * H * Q * T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        flops_achieved = flops_per_iter * (1.0 / dt)  # per second
+        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
 
@@ -285,7 +356,11 @@ class TransformerXL(nn.Module):
         mem = None
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            idx_cond = (
+                idx
+                if idx.size(1) <= self.config.block_size
+                else idx[:, -self.config.block_size :]
+            )
             # forward the model to get the logits for the index in the sequence
             logits, mem, _ = self(idx_cond, mem)
             # pluck the logits at the final step and scale by desired temperature
@@ -293,7 +368,7 @@ class TransformerXL(nn.Module):
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
+                logits[logits < v[:, [-1]]] = -float("Inf")
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
             # sample from the distribution
