@@ -219,12 +219,6 @@ elif init_from == "resume":
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
 
-# crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args["block_size"] = (
-        block_size  # so that the checkpoint will have the right value
-    )
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -266,6 +260,7 @@ def estimate_loss():
     model.train()
     return out
 
+
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -303,8 +298,8 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         print(f"step {iter_num}: evaluating loss")
         losses = estimate_loss()
-        bpc_train = losses['train'] / math.log(2)
-        bpc_val = losses['val'] / math.log(2)
+        bpc_train = losses["train"] / math.log(2)
+        bpc_val = losses["val"] / math.log(2)
         print(
             f"step {iter_num}: "
             f"train loss {losses['train']:.4f}, train bpc {bpc_train:.4f}, "

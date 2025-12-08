@@ -24,30 +24,35 @@ class RelSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.mem_len = config.mem_len
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
 
-        # key, query, value projections for all heads, but in a batch
+        # Query, key, value projections
         self.queries = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.keys = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.values = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
-        self.head_dim = config.n_embd // config.n_head
+        self.head_size = config.n_embd // config.n_head
 
-        self.u = nn.Parameter(torch.zeros(config.n_head, self.head_dim))
-        self.v = nn.Parameter(torch.zeros(config.n_head, self.head_dim))
-        self.r_proj = nn.Linear(self.head_dim, config.n_embd, bias=False)
+        # Learned relative position embeddings
+        self.u = nn.Parameter(torch.zeros(config.n_head, self.head_size))
+        self.v = nn.Parameter(torch.zeros(config.n_head, self.head_size))
 
-        # sinusoidal table for relative positions (0 .. block_size+mem_len-1)
+        # Project relative position embeddings to embedding dimension
+        self.r_proj = nn.Linear(self.head_size, config.n_embd, bias=False)
+
+        # Sinusoidal position embeddings (0 .. block_size+mem_len-1)
         max_len = config.block_size + config.mem_len
-        pos_table = self.sinusoidal_table(max_len, self.head_dim)  # [max_len, d_h]
+        pos_table = self.sinusoidal_table(max_len, self.head_size)  # (M+T, hs)
         self.register_buffer("pos_emb_table", pos_table, persistent=False)
 
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
+        # Combine joined heads into final output
+        self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+        # Regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
 
     @staticmethod
     def sinusoidal_table(
@@ -65,81 +70,77 @@ class RelSelfAttention(nn.Module):
         table[:, 1::2] = torch.cos(angles)
         return table  # (max_len, d_h)
 
-    def forward(self, x, mem=None):
+    def forward(self, h, mem=None):
         """
-        In: x: (B, T, n_embd), mem: (B, M, n_embd)
+        In: h: (B, T, n_embd), mem: (B, M, n_embd)
         Out: y: (B, T, n_embd), new_mem: (B, M + T, n_embd)
         """
-        # batch size, sequence length, embedding dimensionality (n_embd)
-        B, T, C = x.size()
+        B, T, n_embd = h.size()
 
         if mem is not None:
             M = mem.size(1)
-            x_ext = torch.cat([mem, x], dim=1)  # (B,T + M,n_embd)
+            x_ext = torch.cat([mem, h], dim=1)  # (B,L,n_embd)
         else:
             M = 0
-            x_ext = x  # (B,T,n_embd)
-        L = M + T  # Layer length
+            x_ext = h  # (B,T,n_embd)
+        L = M + T
 
-        pos_seq = torch.arange(L - 1, -1, -1, device=x.device)  # (L), reversed
+        pos_seq = torch.arange(L - 1, -1, -1, device=h.device)  # (L), reversed
         R = self.r_proj(self.pos_emb_table[pos_seq])  # (L, C)
-        R = R.view(1, L, self.n_head, C // self.n_head).transpose(
+        R = R.view(1, L, self.n_head, n_embd // self.n_head).transpose(
             1, 2
         )  # (1, nh, L, hs)
 
         u = self.u.unsqueeze(0).unsqueeze(2)  # (1, nh, 1, hs)
         v = self.v.unsqueeze(0).unsqueeze(2)  # (1, nh, 1, hs)
 
-        q = self.queries(x)  # (B,T,n_embd)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-
-        q_u = q + u  # (B, nh, T, hs)
-        q_v = q + v  # (B, nh, T, hs)
+        # Query, key, value projections
+        # (B,T,n_embd) -> (B,T,nh,hs) -> (B,nh,T,hs)
+        q = self.queries(h)
+        q = q.view(B, T, self.n_head, n_embd // self.n_head).transpose(1, 2)
 
         k = self.keys(x_ext)
-        k = k.view(B, L, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, L, hs)
+        k = k.view(B, L, self.n_head, n_embd // self.n_head).transpose(1, 2)
 
         v = self.values(x_ext)
-        v = v.view(B, L, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, L, hs)
+        v = v.view(B, L, self.n_head, n_embd // self.n_head).transpose(1, 2)
 
-        # Build causal mask over extended keys
-        # region Review later
-        key_idx = torch.arange(L, device=x.device)  # (L)
-        query_idx = torch.arange(T, device=x.device) + M  # (T)
-        causal = key_idx.unsqueeze(0) <= query_idx.unsqueeze(1)  # (T,L)
-        attn_mask = ~causal  # True where disallowed
-        attn_mask = attn_mask.view(1, 1, T, L)  # (1,1,T,L)
-        # endregion
+        # TODO: Review later
+        # Build causal mask over extended keys (L) -> (1,1,T,L)
+        key_idx = torch.arange(L, device=h.device)
+        query_idx = torch.arange(T, device=h.device) + M
+        causal = key_idx.unsqueeze(0) <= query_idx.unsqueeze(1)
+        attn_mask = ~causal
+        attn_mask = attn_mask.view(1, 1, T, L)
 
-        AC = torch.matmul(q_u, k.transpose(-2, -1))  # (B,H,T,L)
-        BD_tilde = torch.matmul(q_v, R.transpose(-2, -1))  # [B,H,T,L_rel]
-        BD = self.rel_shift(BD_tilde)  # [B,H,T,L] aligned with K
-        scores = (AC + BD) / math.sqrt(self.head_dim)
+        # Compute attention scores
+        # score = (Q + u)K^T + (Q + v)R^T
+        q_u = q + u  # (B, nh, T, hs)
+        score_u = torch.matmul(q_u, k.transpose(-2, -1))  # (B,nh,T,L)
+
+        q_v = q + v  # (B, nh, T, hs)
+        score_v = torch.matmul(q_v, R.transpose(-2, -1))  # (B,nh,T,L)
+        score_v = self.rel_shift(score_v)  # (B,nh,T,L)
+        scores = (score_u + score_v) / math.sqrt(self.head_size)
         scores = scores.masked_fill(attn_mask, float("-inf"))
-        att = F.softmax(scores, dim=-1)
-        att = self.attn_dropout(att)
-        y = att @ v  # (B,H,T,L) x (B,H,L,hs) -> (B,H,T,hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # region Review later
-        # Output projection
-        y = self.resid_dropout(self.c_proj(y))
+        # Calculate output from scores
+        attn = F.softmax(scores, dim=-1)
+        attn = self.attn_dropout(attn)
+        y = attn @ v  # (B,nh,T,L) x (B,nh,L,hs) -> (B,nh,T,hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, n_embd)
+        y = self.resid_dropout(self.out_proj(y))
 
+        # TODO: Review later
+        # Update memory
         if self.mem_len > 0:
             if mem is None:
-                new_mem_full = x.detach()  # (B, T, C)
+                new_mem_full = h.detach()  # (B, T, C)
             else:
-                new_mem_full = torch.cat([mem, x.detach()], dim=1)  # (B, M+T, C)
+                new_mem_full = torch.cat([mem, h.detach()], dim=1)  # (B, M+T, C)
             new_mem = new_mem_full[:, -self.mem_len :, :]  # (B, mem_len, C)
         else:
             new_mem = None
-        # endregion
 
         return y, new_mem
 
@@ -232,14 +233,7 @@ class TransformerXL(nn.Module):
         print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
     def get_num_params(self):
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
-        n_params = sum(p.numel() for p in self.parameters())
-        return n_params
+        return sum(p.numel() for p in self.parameters())
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -254,13 +248,11 @@ class TransformerXL(nn.Module):
         In: idx: (B,T), mem: list[(M, n_embd)], targets: (B,T)
         Out: logits: (B,T,C), loss: np.float32
         """
-        device = idx.device  # TODO: Check if we create any tensors in new code
-        _, T = idx.size()
-        assert T <= self.config.block_size, (
-            f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        assert idx.size(1) <= self.config.block_size, (
+            f"Cannot forward sequence of length {idx.size(1)}, block size is only {self.config.block_size}"
         )
 
-        # Forward the GPT model itself
+        # Forward the Transformer-XL model itself
         tok_emb = self.transformer.wte(idx)  # (B,T,n_embd)
         x = self.transformer.drop(tok_emb)
 
@@ -287,16 +279,6 @@ class TransformerXL(nn.Module):
             loss = None
 
         return logits, new_mem, loss
-
-    def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self.config.block_size
-        self.config.block_size = block_size
-        for block in self.transformer.h:
-            if hasattr(block.attn, "bias"):
-                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
@@ -331,16 +313,13 @@ class TransformerXL(nn.Module):
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS"""
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+        """Model flops utilization (MFU) from nanoGPT implementation"""
         N = self.get_num_params()
         cfg = self.config
         L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
         flops_per_token = 6 * N + 12 * L * H * Q * T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
         flops_achieved = flops_per_iter * (1.0 / dt)  # per second
         flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
