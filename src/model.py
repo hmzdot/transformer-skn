@@ -105,8 +105,6 @@ class RelSelfAttention(nn.Module):
         v = self.values(x_ext)
         v = v.view(B, L, self.n_head, n_embd // self.n_head).transpose(1, 2)
 
-        # TODO: Review later
-        # Build causal mask over extended keys (L) -> (1,1,T,L)
         key_idx = torch.arange(L, device=h.device)
         query_idx = torch.arange(T, device=h.device) + M
         causal = key_idx.unsqueeze(0) <= query_idx.unsqueeze(1)
@@ -131,7 +129,6 @@ class RelSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, n_embd)
         y = self.resid_dropout(self.out_proj(y))
 
-        # TODO: Review later
         # Update memory
         if self.mem_len > 0:
             if mem is None:
@@ -230,7 +227,7 @@ class TransformerXL(nn.Module):
                     p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
                 )
 
-        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
+        print("Number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -252,7 +249,6 @@ class TransformerXL(nn.Module):
             f"Cannot forward sequence of length {idx.size(1)}, block size is only {self.config.block_size}"
         )
 
-        # Forward the Transformer-XL model itself
         tok_emb = self.transformer.wte(idx)  # (B,T,n_embd)
         x = self.transformer.drop(tok_emb)
 
@@ -260,22 +256,21 @@ class TransformerXL(nn.Module):
             mem = [None] * self.config.n_layer
         new_mem = []
 
+        # For each block, forward the model and update the memory
+        # This way further blocks can attend to memory
         for block, mem_i in zip(self.transformer.h, mem):
             x, mem_i = block(x, mem_i)
             new_mem.append(mem_i)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1
             )
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(
-                x[:, [-1], :]
-            )  # note: using list [-1] to preserve the time dim
+            # nanoGPT optimization: Only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :])
             loss = None
 
         return logits, new_mem, loss
